@@ -8,10 +8,10 @@
  *   D6  -> STEP Y
  *   D3  -> DIR Y
  *   D8  -> Stepper ENABLE (общий, активный LOW)
- *   D11 -> PEN (соленоид через MOSFET)        ← на shield это «Spindle»
- *   D10 -> Y_LIMIT (концевик каретки)         ← shield Y-
- *   A4  -> SoftwareSerial RX от TX головы     ← через провод к разъёму J4 платы
- *   A5  -> SoftwareSerial TX к RX головы
+ *   D11 -> PEN (соленоид через MOSFET)        ← shield Z+
+ *   D9  -> X_LIMIT (концевик каретки)         ← shield X-
+ *   В4  -> Кнопка аварийной остановки         ← shield Z-DIR
+ *   A4  -> SoftwareSerial RX от TX головы
  *
  *   D0/D1 (USB) — для отладки в Serial monitor 115200
  *
@@ -31,50 +31,55 @@
 #include <SoftwareSerial.h>
 
 // ===================== Конфиг =========================================
-constexpr int PIN_X_STEP   = 5;
-constexpr int PIN_X_DIR    = 2;
-constexpr int PIN_Y_STEP   = 6;
-constexpr int PIN_Y_DIR    = 3;
-constexpr int PIN_ENABLE   = 8;     // active LOW
-constexpr int PIN_PEN      = 11;
-constexpr int PIN_Y_LIMIT  = 10;
-constexpr int PIN_HEAD_RX  = A5;    // SoftSerial RX
-constexpr int PIN_HEAD_TX  = A4;    // SoftSerial TX
-constexpr int PIN_LED      = 13;    // встроенный LED Nano
+constexpr int PIN_X_STEP = 5;
+constexpr int PIN_X_DIR = 2;
+constexpr int PIN_Y_STEP = 6;
+constexpr int PIN_Y_DIR = 3;
+constexpr int PIN_ENABLE = 8;  // active LOW
+constexpr int PIN_ESTOP = 4;   // аварийная кнопка
+constexpr int PIN_PEN = 11;
+constexpr int PIN_X_LIMIT = 9;
+constexpr int PIN_HEAD_RX = A5;  // SoftSerial RX
+constexpr int PIN_HEAD_TX = A4;  // SoftSerial TX
+constexpr int PIN_LED = 13;      // встроенный LED Nano
 
-constexpr bool PEN_ACTIVE_HIGH    = true;   // HIGH = опустить
-constexpr bool LIMIT_ACTIVE_LOW   = true;
-constexpr bool INVERT_X_DIR       = false;
-constexpr bool INVERT_Y_DIR       = false;
+constexpr bool PEN_ACTIVE_HIGH = true;  // HIGH = опустить
+constexpr bool X_LIMIT_ACTIVE_LOW = false;
+constexpr bool INVERT_X_DIR = true;
+constexpr bool INVERT_Y_DIR = true;
 
-constexpr long  HEAD_BAUD       = 10000;
-constexpr long  USB_BAUD        = 115200;
+constexpr long HEAD_BAUD = 10000;
+constexpr long USB_BAUD = 115200;
 
 // Кинематика
-constexpr float STEPS_PER_MM_X  = 80.0f;    // валик подачи (откалибровать!)
-constexpr float STEPS_PER_MM_Y  = 80.0f;    // каретка
-constexpr int   UNITS_PER_MM    = 40;       // 40 юнит = 1 мм (плоттер)
-constexpr float STEPS_PER_UNIT_X = STEPS_PER_MM_X / UNITS_PER_MM; // 2.0
+constexpr int CANVAS_X = 280;                                      // максимальная дальность по X в мм
+constexpr int CANVAS_Y = 400;                                      // максимальная дальность по Y в мм (валик, тут в теории бесконечно много)
+constexpr float STEPS_PER_MM_X = 36.36f;                           // каретка
+constexpr float STEPS_PER_MM_Y = 32.00f;                           // валик подачи
+constexpr int UNITS_PER_MM = 40;                                   // 40 юнит = 1 мм (плоттер)
+constexpr float STEPS_PER_UNIT_X = STEPS_PER_MM_X / UNITS_PER_MM;  // 2.0
 constexpr float STEPS_PER_UNIT_Y = STEPS_PER_MM_Y / UNITS_PER_MM;
 
 // Скорости (шагов/сек). 600 mm/min × 80 step/mm / 60 = 800 шаг/сек.
-constexpr float MOVE_SPEED_SPS  = 800.0f;
-constexpr float CUT_SPEED_SPS   = 400.0f;
-constexpr float ACCEL_SPS2      = 2000.0f;
+constexpr float MOVE_SPEED_SPS = 800.0f;
+constexpr float CUT_SPEED_SPS = 400.0f;
+constexpr float ACCEL_SPS2 = 2000.0f;
 
 // Homing
-constexpr long HOMING_MAX_STEPS = (long)(280 * STEPS_PER_MM_Y);
-constexpr float HOMING_SEEK_SPS = 1500.0f;
-constexpr float HOMING_FEED_SPS = 400.0f;
-constexpr long  HOMING_PULL_OFF_STEPS = (long)(3 * STEPS_PER_MM_Y);
-constexpr bool  HOMING_DIR_Y_NEG = true;
+constexpr long HOMING_MAX_STEPS_X = (long)(CANVAS_X * STEPS_PER_MM_X);  // макс ход по X
+constexpr long HOMING_MAX_STEPS_Y = (long)(CANVAS_Y * STEPS_PER_MM_Y);
+constexpr float HOMING_SEEK_SPS = 600.0f;
+constexpr float HOMING_FEED_SPS = 300.0f;
+constexpr long HOMING_PULL_OFF_STEPS_X = (long)(3 * STEPS_PER_MM_X);
+constexpr long HOMING_PULL_OFF_STEPS_Y = (long)(3 * STEPS_PER_MM_Y);
+constexpr bool HOMING_DIR_X_INVERT = false;
 
 // Идентификация (то что MCU возвращает в RCMD=11)
 const char DEVICE_SERIAL[] PROGMEM = "002400143439470C35303835";
-const char DEVICE_VERSION[]PROGMEM = "6";
+const char DEVICE_VERSION[] PROGMEM = "6";
 
 // Очередь движений
-constexpr uint8_t QUEUE_CAP = 96;   // на ATmega328P 96 элементов = ~480 байт SRAM
+constexpr uint8_t QUEUE_CAP = 96;  // на ATmega328P 96 элементов = ~480 байт SRAM
 struct MotionCmd {
   bool pen_down;
   int16_t x_units;
@@ -90,7 +95,9 @@ inline uint8_t qSize() {
 inline uint8_t queueSize() {
   return (qTail >= qHead) ? (qTail - qHead) : (QUEUE_CAP - qHead + qTail);
 }
-inline bool queueEmpty() { return qHead == qTail; }
+inline bool queueEmpty() {
+  return qHead == qTail;
+}
 bool queuePush(const MotionCmd& c) {
   uint8_t next = (qTail + 1) % QUEUE_CAP;
   if (next == qHead) return false;
@@ -111,14 +118,14 @@ AccelStepper stepperY(AccelStepper::DRIVER, PIN_Y_STEP, PIN_Y_DIR);
 SoftwareSerial headSerial(PIN_HEAD_RX, PIN_HEAD_TX);
 
 bool penDown = false;
-bool busy    = false;
+bool busy = false;
 bool drawActive = false;
 bool drawAck10_1Sent = false;
 bool drawAck10_0Sent = true;
 
-int  pressureVal  = 48;
-int  moveSpeedPct = 100;
-int  cutSpeedPct  = 20;
+int pressureVal = 48;
+int moveSpeedPct = 100;
+int cutSpeedPct = 20;
 
 // ===================== Вспомогательное ===============================
 void setEnable(bool en) {
@@ -136,9 +143,9 @@ void penDownNow() {
   delay(15);
 }
 
-inline bool yLimitTriggered() {
-  int v = digitalRead(PIN_Y_LIMIT);
-  return LIMIT_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+inline bool xLimitTriggered() {
+  int v = digitalRead(PIN_X_LIMIT);
+  return X_LIMIT_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
 }
 
 void applySpeedFromCmd(bool penDownNow_) {
@@ -165,54 +172,60 @@ void sendRcmdString(const String& s) {
 
 void handleBdCommand(int id, const String& args) {
   switch (id) {
-    case 11: {
-      String r = F("RCMD=11,");
-      // serial из PROGMEM
-      char buf[28];
-      strcpy_P(buf, DEVICE_SERIAL);
-      r += buf;
-      r += ',';
-      strcpy_P(buf, DEVICE_VERSION);
-      r += buf;
-      r += ';';
-      sendRcmdString(r);
-      break;
-    }
-    case 30: {
-      // главный init — здесь оригинал делал self-homing и возвращал тики
-      doHomeY();
-      sendRcmdString(String(F("RCMD=30,0,")) + millis() + ';');
-      break;
-    }
-    case 31: {
-      // 31,0=reboot, 31,1=power off — просто сбросим состояние
-      while (queuePop(*reinterpret_cast<MotionCmd*>(queueBuf))) {}  // не работает на queue, см. реальный clear
-      qHead = qTail = 0;
-      stepperX.stop();
-      stepperY.stop();
-      drawActive = false;
-      busy = false;
-      break;
-    }
-    case 50: {
-      pressureVal = args.toInt();
-      sendRcmdString(String(F("RCMD=51,")) + pressureVal + ';');
-      break;
-    }
+    case 11:
+      {
+        String r = F("RCMD=11,");
+        // serial из PROGMEM
+        char buf[28];
+        strcpy_P(buf, DEVICE_SERIAL);
+        r += buf;
+        r += ',';
+        strcpy_P(buf, DEVICE_VERSION);
+        r += buf;
+        r += ';';
+        sendRcmdString(r);
+        break;
+      }
+    case 30:
+      {
+        // главный init — здесь оригинал делал self-homing и возвращал тики
+        doHomeX();
+        sendRcmdString(String(F("RCMD=30,0,")) + millis() + ';');
+        break;
+      }
+    case 31:
+      {
+        // 31,0=reboot, 31,1=power off — просто сбросим состояние
+        while (queuePop(*reinterpret_cast<MotionCmd*>(queueBuf))) {}  // не работает на queue, см. реальный clear
+        qHead = qTail = 0;
+        stepperX.stop();
+        stepperY.stop();
+        drawActive = false;
+        busy = false;
+        break;
+      }
+    case 50:
+      {
+        pressureVal = args.toInt();
+        sendRcmdString(String(F("RCMD=51,")) + pressureVal + ';');
+        break;
+      }
     case 51: sendRcmdString(String(F("RCMD=51,")) + pressureVal + ';'); break;
     case 54: sendRcmdString(String(F("RCMD=54,")) + args + ';'); break;
     case 55: sendRcmd_P(F("RCMD=55,255;")); break;
-    case 56: {
-      cutSpeedPct = args.toInt();
-      sendRcmdString(String(F("RCMD=57,")) + cutSpeedPct + ';');
-      break;
-    }
+    case 56:
+      {
+        cutSpeedPct = args.toInt();
+        sendRcmdString(String(F("RCMD=57,")) + cutSpeedPct + ';');
+        break;
+      }
     case 57: sendRcmdString(String(F("RCMD=57,")) + cutSpeedPct + ';'); break;
-    case 62: {
-      moveSpeedPct = args.toInt();
-      sendRcmdString(String(F("RCMD=63,")) + moveSpeedPct + ';');
-      break;
-    }
+    case 62:
+      {
+        moveSpeedPct = args.toInt();
+        sendRcmdString(String(F("RCMD=63,")) + moveSpeedPct + ';');
+        break;
+      }
     case 63: sendRcmdString(String(F("RCMD=63,")) + moveSpeedPct + ';'); break;
     case 66: sendRcmdString(String(F("RCMD=67,")) + args + ';'); break;
     case 67: sendRcmd_P(F("RCMD=67,15000,15145,10000,9980;")); break;
@@ -258,7 +271,11 @@ void handleDrawToken(const char* tok, uint8_t len) {
 
   // парсим x,y
   int comma = -1;
-  for (uint8_t i = 1; i < len; i++) if (tok[i] == ',') { comma = i; break; }
+  for (uint8_t i = 1; i < len; i++)
+    if (tok[i] == ',') {
+      comma = i;
+      break;
+    }
   if (comma < 0) return;
   // временно вырезаем
   char tmp[20];
@@ -276,8 +293,8 @@ void handleDrawToken(const char* tok, uint8_t len) {
 
   MotionCmd cmd;
   cmd.pen_down = (c == 'A');
-  cmd.x_units  = x;
-  cmd.y_units  = y;
+  cmd.x_units = x;
+  cmd.y_units = y;
   if (queuePush(cmd)) {
     if (!drawAck10_1Sent) {
       sendRcmd_P(F("RCMD=10,1;"));
@@ -292,9 +309,14 @@ void handleDrawToken(const char* tok, uint8_t len) {
 void parserFeed(uint8_t b) {
   switch (pState) {
     case PS_IDLE:
-      if (b == ';') { pState = PS_BD_HEAD; parserReset(); }
-      else if (b == 'V') { pState = PS_DRAW_SIG; parserReset(); parserAppend('V'); }
-      else if (b == 'I' || b == 'R' || b == 'A' || b == '@') {
+      if (b == ';') {
+        pState = PS_BD_HEAD;
+        parserReset();
+      } else if (b == 'V') {
+        pState = PS_DRAW_SIG;
+        parserReset();
+        parserAppend('V');
+      } else if (b == 'I' || b == 'R' || b == 'A' || b == '@') {
         // программа без сигнатуры (от ПК)
         drawActive = true;
         drawAck10_1Sent = false;
@@ -320,7 +342,11 @@ void parserFeed(uint8_t b) {
       if (b == ';') {
         // распарсить id,args
         int comma = -1;
-        for (uint8_t i = 0; i < parseLen; i++) if (parseBuf[i] == ',') { comma = i; break; }
+        for (uint8_t i = 0; i < parseLen; i++)
+          if (parseBuf[i] == ',') {
+            comma = i;
+            break;
+          }
         String args;
         int id;
         if (comma < 0) {
@@ -416,41 +442,49 @@ void motionTick() {
 }
 
 // ===================== Homing ========================================
-void doHomeY() {
-  Serial.println(F("[HOME] start"));
+void doHomeX() {
+  Serial.println(F("[HOME] start X axis"));
   penUp();
-  // быстрый seek
-  stepperY.setMaxSpeed(HOMING_SEEK_SPS);
-  long dir = HOMING_DIR_Y_NEG ? -1 : 1;
-  stepperY.move(dir * HOMING_MAX_STEPS);
+
+  // Быстрый поиск концевика
+  stepperX.setMaxSpeed(HOMING_SEEK_SPS);
+  long dir = HOMING_DIR_X_INVERT ? -1 : 1;
+  stepperX.move(dir * HOMING_MAX_STEPS_X);
+
   unsigned long t0 = millis();
-  while (stepperY.distanceToGo() != 0) {
-    stepperY.run();
-    if (yLimitTriggered()) {
-      stepperY.stop();
-      while (stepperY.distanceToGo() != 0) stepperY.run();
+  while (stepperX.distanceToGo() != 0) {
+    stepperX.run();
+    if (xLimitTriggered()) {
+      stepperX.stop();
+      while (stepperX.distanceToGo() != 0) stepperX.run();
       break;
     }
-    if (millis() - t0 > 30000) { stepperY.stop(); break; }
+    if (millis() - t0 > 30000) {
+      stepperX.stop();
+      break;
+    }
   }
   delay(80);
-  // pull-off
-  stepperY.setMaxSpeed(HOMING_FEED_SPS);
-  stepperY.move(-dir * HOMING_PULL_OFF_STEPS);
-  while (stepperY.distanceToGo() != 0) stepperY.run();
+
+  // Отход от концевика (pull-off)
+  stepperX.setMaxSpeed(HOMING_FEED_SPS);
+  stepperX.move(-dir * HOMING_PULL_OFF_STEPS_X);
+  while (stepperX.distanceToGo() != 0) stepperX.run();
   delay(50);
-  // финальный медленный подвод
-  stepperY.move(dir * HOMING_PULL_OFF_STEPS * 2);
-  while (stepperY.distanceToGo() != 0) {
-    stepperY.run();
-    if (yLimitTriggered()) {
-      stepperY.stop();
-      while (stepperY.distanceToGo() != 0) stepperY.run();
+
+  // Финальный медленный подвод
+  stepperX.move(dir * HOMING_PULL_OFF_STEPS_X * 2);
+  while (stepperX.distanceToGo() != 0) {
+    stepperX.run();
+    if (xLimitTriggered()) {
+      stepperX.stop();
+      while (stepperX.distanceToGo() != 0) stepperX.run();
       break;
     }
   }
   delay(50);
-  // нулевая позиция
+
+  // Установка нулевой позиции
   stepperX.setCurrentPosition(0);
   stepperY.setCurrentPosition(0);
   stepperX.setMaxSpeed(MOVE_SPEED_SPS);
@@ -463,46 +497,114 @@ String pcCmdBuf;
 uint32_t lastPcByte = 0;
 
 void execPcCommand(const String& cmd) {
-  Serial.print(F("[CMD] ")); Serial.println(cmd);
+  Serial.print(F("[CMD] "));
+  Serial.println(cmd);
   if (cmd == "T" || cmd == "?") {
-    Serial.print(F("[STATUS] X=")); Serial.print(stepperX.currentPosition());
-    Serial.print(F(" Y=")); Serial.print(stepperY.currentPosition());
-    Serial.print(F(" queue=")); Serial.print(queueSize());
-    Serial.print(F(" busy=")); Serial.println(busy);
+    Serial.print(F("[STATUS] X="));
+    Serial.print(stepperX.currentPosition());
+    Serial.print(F(" Y="));
+    Serial.print(stepperY.currentPosition());
+    Serial.print(F(" queue="));
+    Serial.print(queueSize());
+    Serial.print(F(" busy="));
+    Serial.println(busy);
   } else if (cmd == "STOP") {
-    stepperX.stop(); stepperY.stop();
+    // Мгновенная остановка с учетом ускорения
+    stepperX.stop();
+    stepperY.stop();
+
+    // Очищаем очередь команд
     qHead = qTail = 0;
-    busy = false; drawActive = false;
-    Serial.println(F("[STOP]"));
+
+    // Принудительно останавливаем движение
+    stepperX.move(0);
+    stepperY.move(0);
+
+    // Поднимаем перо
+    if (penDown) penUp();
+
+    // Сбрасываем флаги
+    busy = false;
+    drawActive = false;
+    drawAck10_1Sent = false;
+    drawAck10_0Sent = true;
+    delay(100);
+
+    // Устанавливаем текущую позицию как ту, где реально остановились, чтобы после STOP не было рывков
+    stepperX.setCurrentPosition(stepperX.currentPosition());
+    stepperY.setCurrentPosition(stepperY.currentPosition());
+
+    Serial.println(F("[STOP] Motors stopped and queue cleared"));
+
+  } else if (cmd == "HALT") {
+    setEnable(false);  // отключаем питание моторов
+    qHead = qTail = 0;
+    busy = false;
+    drawActive = false;
+    Serial.println(F("[HALT] Motors disabled"));
+    Serial.println(F("Use 'EN' to re-enable"));
   } else if (cmd == "PEN") {
-    if (penDown) penUp(); else penDownNow();
+    if (penDown) penUp();
+    else penDownNow();
     Serial.println(penDown ? F("[PEN] DOWN") : F("[PEN] UP"));
   } else if (cmd == "HOME") {
-    doHomeY();
-  } else if (cmd == "X+" || cmd == "X-") {
-    long s = (cmd == "X+") ? 80 : -80;  // 1 мм
-    stepperX.setMaxSpeed(MOVE_SPEED_SPS);
-    stepperX.move(s);
-    busy = true;
-    Serial.print(F("[JOG X] ")); Serial.println(s);
-  } else if (cmd == "Y+" || cmd == "Y-") {
-    long s = (cmd == "Y+") ? 80 : -80;
-    stepperY.setMaxSpeed(MOVE_SPEED_SPS);
-    stepperY.move(s);
-    busy = true;
-    Serial.print(F("[JOG Y] ")); Serial.println(s);
-  } else if (cmd == "X++" || cmd == "X--") {
-    long s = (cmd == "X++") ? 800 : -800;  // 10 мм
-    stepperX.setMaxSpeed(MOVE_SPEED_SPS);
-    stepperX.move(s);
-    busy = true;
-    Serial.print(F("[JOG X*10] ")); Serial.println(s);
-  } else if (cmd == "Y++" || cmd == "Y--") {
-    long s = (cmd == "Y++") ? 800 : -800;
-    stepperY.setMaxSpeed(MOVE_SPEED_SPS);
-    stepperY.move(s);
-    busy = true;
-    Serial.print(F("[JOG Y*10] ")); Serial.println(s);
+    doHomeX();
+  } else if (cmd.startsWith("X+") || cmd.startsWith("X-")) {
+    long steps = 0;
+    float distance_mm = 0;
+
+    if (cmd == "X+") distance_mm = 1.0;  // 1 мм
+    else if (cmd == "X-") distance_mm = -1.0;
+    else if (cmd == "X++") distance_mm = 10.0;  // 10 мм
+    else if (cmd == "X--") distance_mm = -10.0;
+    else {
+      // Парсим X+50, X-30 и т.д. - число в МИЛЛИМЕТРАХ
+      float mm = cmd.substring(2).toFloat();
+      if (cmd.startsWith("X+")) distance_mm = mm;
+      else if (cmd.startsWith("X-")) distance_mm = -mm;
+    }
+
+    if (distance_mm != 0) {
+      // переводим мм в шаги
+      steps = (long)(distance_mm * STEPS_PER_MM_X);
+      if (INVERT_X_DIR) steps = -steps;
+      stepperX.setMaxSpeed(MOVE_SPEED_SPS);
+      stepperX.move(steps);
+      busy = true;
+      Serial.print(F("[JOG X] "));
+      Serial.print(distance_mm);
+      Serial.print(F(" mm = "));
+      Serial.print(steps);
+      Serial.println(F(" steps"));
+      return;
+    }
+  } else if (cmd.startsWith("Y+") || cmd.startsWith("Y-")) {
+    long steps = 0;
+    float distance_mm = 0;
+
+    if (cmd == "Y+") distance_mm = 1.0;
+    else if (cmd == "Y-") distance_mm = -1.0;
+    else if (cmd == "Y++") distance_mm = 10.0;
+    else if (cmd == "Y--") distance_mm = -10.0;
+    else {
+      float mm = cmd.substring(2).toFloat();
+      if (cmd.startsWith("Y+")) distance_mm = mm;
+      else if (cmd.startsWith("Y-")) distance_mm = -mm;
+    }
+
+    if (distance_mm != 0) {
+      steps = (long)(distance_mm * STEPS_PER_MM_Y);
+      if (INVERT_Y_DIR) steps = -steps;
+      stepperY.setMaxSpeed(MOVE_SPEED_SPS);
+      stepperY.move(steps);
+      busy = true;
+      Serial.print(F("[JOG Y] "));
+      Serial.print(distance_mm);
+      Serial.print(F(" mm = "));
+      Serial.print(steps);
+      Serial.println(F(" steps"));
+      return;
+    }
   } else if (cmd == "EN") {
     setEnable(true);
     Serial.println(F("[EN] ON"));
@@ -510,14 +612,37 @@ void execPcCommand(const String& cmd) {
     setEnable(false);
     Serial.println(F("[EN] OFF"));
   } else if (cmd == "PINS") {
-    Serial.print(F("[PINS] EN=")); Serial.print(digitalRead(PIN_ENABLE));
-    Serial.print(F(" Y_LIMIT=")); Serial.print(digitalRead(PIN_Y_LIMIT));
-    Serial.print(F(" PEN=")); Serial.println(digitalRead(PIN_PEN));
+    Serial.print(F("[PINS] EN="));
+    Serial.print(digitalRead(PIN_ENABLE));
+    Serial.print(F(" X_LIMIT="));
+    Serial.print(digitalRead(PIN_X_LIMIT));
+    Serial.print(F(" PEN="));
+    Serial.println(digitalRead(PIN_PEN));
   } else if (cmd == "HELP") {
-    Serial.println(F("Commands: T, X+/-, Y+/-, X++/--, Y++/--, PEN, HOME,"));
-    Serial.println(F("  STOP, EN, DIS, PINS"));
+    Serial.println(F("=== PLOTTER COMMANDS ==="));
+    Serial.println(F("  X+50      - Move X by 50 mm right"));
+    Serial.println(F("  X-30      - Move X by 30 mm left"));
+    Serial.println(F("  Y+25      - Move Y by 25 mm forward"));
+    Serial.println(F("  Y-10      - Move Y by 10 mm back"));
+    Serial.println(F("  X+, X-    - Move X by 1 mm"));
+    Serial.println(F("  X++, X--  - Move X by 10 mm"));
+    Serial.println(F("  Y+, Y-    - Move Y by 1 mm"));
+    Serial.println(F("  Y++, Y--  - Move Y by 10 mm"));
+    Serial.println(F("  PEN       - Toggle pen up/down"));
+    Serial.println(F("  HOME      - Go to home position"));
+    Serial.println(F("  STOP      - Stop motors and clear queue"));
+    Serial.println(F("  HALT      - Emergency stop"));
+    Serial.println(F("  EN/DIS    - Enable/disable motors"));
+    Serial.println(F("  PINS      - Read pin states"));
+    Serial.println(F("  T or ?    - Status"));
+    Serial.print(F("  Current calibration: X="));
+    Serial.print(STEPS_PER_MM_X);
+    Serial.print(F(" steps/mm, Y="));
+    Serial.print(STEPS_PER_MM_Y);
+    Serial.println(F(" steps/mm"));
   } else {
-    Serial.print(F("[?] unknown: ")); Serial.println(cmd);
+    Serial.print(F("[?] unknown: "));
+    Serial.println(cmd);
   }
 }
 
@@ -540,13 +665,15 @@ void handlePcByte(uint8_t b) {
 // ===================== setup / loop ==================================
 void setup() {
   pinMode(PIN_ENABLE, OUTPUT);
-  setEnable(true);   // включаем драйверы
+  setEnable(true);  // включаем драйверы
 
   pinMode(PIN_PEN, OUTPUT);
   penUp();
 
-  pinMode(PIN_Y_LIMIT, INPUT_PULLUP);
+  pinMode(PIN_X_LIMIT, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
+
+  pinMode(PIN_ESTOP, INPUT_PULLUP);
 
   stepperX.setMaxSpeed(MOVE_SPEED_SPS);
   stepperX.setAcceleration(ACCEL_SPS2);
@@ -558,22 +685,54 @@ void setup() {
 
   Serial.println();
   Serial.println(F("======================================"));
-  Serial.println(F("Plotter MCU (Nano + CNC Shield)"));
-  Serial.print(F("STEP X=")); Serial.print(PIN_X_STEP);
-  Serial.print(F(" DIR X=")); Serial.print(PIN_X_DIR);
-  Serial.print(F(" STEP Y=")); Serial.print(PIN_Y_STEP);
-  Serial.print(F(" DIR Y=")); Serial.println(PIN_Y_DIR);
-  Serial.print(F("EN=")); Serial.print(PIN_ENABLE);
-  Serial.print(F(" PEN=")); Serial.print(PIN_PEN);
-  Serial.print(F(" Y_LIM=")); Serial.println(PIN_Y_LIMIT);
-  Serial.print(F("HEAD UART rx=")); Serial.print(PIN_HEAD_RX);
-  Serial.print(F(" tx=")); Serial.print(PIN_HEAD_TX);
-  Serial.print(F(" @ ")); Serial.println(HEAD_BAUD);
+  Serial.println(F("ACECUTTER_A30 CUSTOM MCU (Nano + CNC Shield)"));
+  Serial.print(F("STEP X="));
+  Serial.print(PIN_X_STEP);
+  Serial.print(F(" DIR X="));
+  Serial.print(PIN_X_DIR);
+  Serial.print(F(" STEP Y="));
+  Serial.print(PIN_Y_STEP);
+  Serial.print(F(" DIR Y="));
+  Serial.println(PIN_Y_DIR);
+  Serial.print(F("EN="));
+  Serial.print(PIN_ENABLE);
+  Serial.print(F(" PEN="));
+  Serial.print(PIN_PEN);
+  Serial.print(F(" X_LIM="));
+  Serial.println(PIN_X_LIMIT);
+  Serial.print(F("HEAD UART rx="));
+  Serial.print(PIN_HEAD_RX);
+  Serial.print(F(" tx="));
+  Serial.print(PIN_HEAD_TX);
+  Serial.print(F(" @ "));
+  Serial.println(HEAD_BAUD);
   Serial.println(F("Type HELP for diag commands"));
   Serial.println(F("======================================"));
 }
 
+void emergencyStop() {
+  static bool wasStopped = false;
+  if (!wasStopped) {
+    Serial.println(F("!!! EMERGENCY STOP !!!"));
+    Serial.println(F("Use 'EN' to re-enable"));
+    stepperX.stop();
+    stepperY.stop();
+    stepperX.move(0);
+    stepperY.move(0);
+    qHead = qTail = 0;
+    busy = false;
+    drawActive = false;
+    setEnable(false);  // отключаем питание моторов
+    wasStopped = true;
+  }
+}
+
 void loop() {
+  // 0. Б - безопасность
+  if (digitalRead(PIN_ESTOP) == LOW) {
+    emergencyStop();
+  }
+
   // 1. читаем байты от головы
   while (headSerial.available()) {
     uint8_t b = headSerial.read();
@@ -581,7 +740,7 @@ void loop() {
     Serial.write(b);  // эхо в USB лог
   }
 
-  // 2. читаем USB CDC
+  // 2. читаем USB Serial
   while (Serial.available()) {
     uint8_t b = Serial.read();
     handlePcByte(b);
