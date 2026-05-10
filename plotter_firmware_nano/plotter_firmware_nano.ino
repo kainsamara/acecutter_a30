@@ -3,10 +3,10 @@
  * Эмулирует MCU тела AceCutter A30 для общения с Android-головой.
  *
  * Подключения (стандартный GRBL pinout):
- *   D2  -> STEP X
- *   D5  -> DIR X
- *   D3  -> STEP Y
- *   D6  -> DIR Y
+ *   D5  -> STEP X
+ *   D2  -> DIR X
+ *   D6  -> STEP Y
+ *   D3  -> DIR Y
  *   D8  -> Stepper ENABLE (общий, активный LOW)
  *   D11 -> PEN (соленоид через MOSFET)        ← на shield это «Spindle»
  *   D10 -> Y_LIMIT (концевик каретки)         ← shield Y-
@@ -31,15 +31,15 @@
 #include <SoftwareSerial.h>
 
 // ===================== Конфиг =========================================
-constexpr int PIN_X_STEP   = 2;
-constexpr int PIN_X_DIR    = 5;
-constexpr int PIN_Y_STEP   = 3;
-constexpr int PIN_Y_DIR    = 6;
+constexpr int PIN_X_STEP   = 5;
+constexpr int PIN_X_DIR    = 2;
+constexpr int PIN_Y_STEP   = 6;
+constexpr int PIN_Y_DIR    = 3;
 constexpr int PIN_ENABLE   = 8;     // active LOW
 constexpr int PIN_PEN      = 11;
 constexpr int PIN_Y_LIMIT  = 10;
-constexpr int PIN_HEAD_RX  = A4;    // SoftSerial RX
-constexpr int PIN_HEAD_TX  = A5;    // SoftSerial TX
+constexpr int PIN_HEAD_RX  = A5;    // SoftSerial RX
+constexpr int PIN_HEAD_TX  = A4;    // SoftSerial TX
 constexpr int PIN_LED      = 13;    // встроенный LED Nano
 
 constexpr bool PEN_ACTIVE_HIGH    = true;   // HIGH = опустить
