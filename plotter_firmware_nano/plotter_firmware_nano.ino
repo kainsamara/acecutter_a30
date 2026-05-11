@@ -8,10 +8,11 @@
  *   D6  -> STEP Y
  *   D3  -> DIR Y
  *   D8  -> Stepper ENABLE (общий, активный LOW)
- *   D11 -> PEN (соленоид через MOSFET)        ← shield Z+
- *   D9  -> X_LIMIT (концевик каретки)         ← shield X-
- *   В4  -> Кнопка аварийной остановки         ← shield Z-DIR
- *   A4  -> SoftwareSerial RX от TX головы
+ *   D11 -> PEN (соленоид через MOSFET)         ← shield Z+
+ *   D9  -> X1_LIMIT (левый концевик каретки)   ← shield X-
+ *   D10 -> X2_LIMIT (правый концевик каретки)  ← shield Y-
+ *   D4  -> Кнопка аварийной остановки          ← shield Z-DIR
+ *   A4  -> SoftwareSerial RX от TX голов
  *
  *   D0/D1 (USB) — для отладки в Serial monitor 115200
  *
@@ -38,48 +39,48 @@ constexpr int PIN_Y_DIR = 3;
 constexpr int PIN_ENABLE = 8;  // active LOW
 constexpr int PIN_ESTOP = 4;   // аварийная кнопка
 constexpr int PIN_PEN = 11;
-constexpr int PIN_X_LIMIT = 9;
-constexpr int PIN_HEAD_RX = A5;  // SoftSerial RX
-constexpr int PIN_HEAD_TX = A4;  // SoftSerial TX
-constexpr int PIN_LED = 13;      // встроенный LED Nano
+constexpr int PIN_X1_LIMIT = 9;   // левый концевик (home)
+constexpr int PIN_X2_LIMIT = 10;  // правый концевик
+constexpr int PIN_HEAD_RX = A5;   // SoftSerial RX
+constexpr int PIN_HEAD_TX = A4;   // SoftSerial TX
+constexpr int PIN_LED = 13;       // встроенный LED Nano
 
-constexpr bool PEN_ACTIVE_HIGH = true;  // HIGH = опустить
-constexpr bool X_LIMIT_ACTIVE_LOW = false;
+constexpr bool PEN_ACTIVE_HIGH = true;       // HIGH = опустить
+constexpr bool X1_LIMIT_ACTIVE_LOW = false;  // левый концевик (HIGH при нажатии)
+constexpr bool X2_LIMIT_ACTIVE_LOW = false;  // правый концевик (HIGH при нажатии)
 constexpr bool INVERT_X_DIR = true;
 constexpr bool INVERT_Y_DIR = true;
+constexpr bool INVERT_DIR_X_HOMING = false;
 
 constexpr long HEAD_BAUD = 10000;
 constexpr long USB_BAUD = 115200;
 
 // Кинематика
 constexpr int CANVAS_X = 280;                                      // максимальная дальность по X в мм
-constexpr int CANVAS_Y = 400;                                      // максимальная дальность по Y в мм (валик, тут в теории бесконечно много)
 constexpr float STEPS_PER_MM_X = 36.36f;                           // каретка
 constexpr float STEPS_PER_MM_Y = 32.00f;                           // валик подачи
 constexpr int UNITS_PER_MM = 40;                                   // 40 юнит = 1 мм (плоттер)
-constexpr float STEPS_PER_UNIT_X = STEPS_PER_MM_X / UNITS_PER_MM;  // 2.0
+constexpr float STEPS_PER_UNIT_X = STEPS_PER_MM_X / UNITS_PER_MM;
 constexpr float STEPS_PER_UNIT_Y = STEPS_PER_MM_Y / UNITS_PER_MM;
 
-// Скорости (шагов/сек). 600 mm/min × 80 step/mm / 60 = 800 шаг/сек.
+// Скорости (шагов/сек)
 constexpr float MOVE_SPEED_SPS = 800.0f;
 constexpr float CUT_SPEED_SPS = 400.0f;
 constexpr float ACCEL_SPS2 = 2000.0f;
 
-// Homing
-constexpr long HOMING_MAX_STEPS_X = (long)(CANVAS_X * STEPS_PER_MM_X);  // макс ход по X
+// Homing (поиск левого концевика)
+constexpr long HOMING_MAX_STEPS_X = (long)(CANVAS_X * STEPS_PER_MM_X);
 constexpr long HOMING_MAX_STEPS_Y = (long)(CANVAS_Y * STEPS_PER_MM_Y);
 constexpr float HOMING_SEEK_SPS = 600.0f;
 constexpr float HOMING_FEED_SPS = 300.0f;
-constexpr long HOMING_PULL_OFF_STEPS_X = (long)(3 * STEPS_PER_MM_X);
-constexpr long HOMING_PULL_OFF_STEPS_Y = (long)(3 * STEPS_PER_MM_Y);
-constexpr bool HOMING_DIR_X_INVERT = false;
+constexpr long HOMING_PULL_OFF_STEPS_X = (long)(5 * STEPS_PER_MM_X);
+constexpr long HOMING_PULL_OFF_STEPS_Y = (long)(5 * STEPS_PER_MM_Y);
 
 // Идентификация (то что MCU возвращает в RCMD=11)
 const char DEVICE_SERIAL[] PROGMEM = "002400143439470C35303835";
 const char DEVICE_VERSION[] PROGMEM = "6";
 
 // Очередь движений
-constexpr uint8_t QUEUE_CAP = 96;  // на ATmega328P 96 элементов = ~480 байт SRAM
 struct MotionCmd {
   bool pen_down;
   int16_t x_units;
@@ -686,6 +687,8 @@ void setup() {
   Serial.println();
   Serial.println(F("======================================"));
   Serial.println(F("ACECUTTER_A30 CUSTOM MCU (Nano + CNC Shield)"));
+  Serial.println(F("Dual limit switches on X axis supported"));
+  Serial.println(F("Left limit -> auto HOME, Right limit -> auto pull-off"));
   Serial.print(F("STEP X="));
   Serial.print(PIN_X_STEP);
   Serial.print(F(" DIR X="));
@@ -698,8 +701,10 @@ void setup() {
   Serial.print(PIN_ENABLE);
   Serial.print(F(" PEN="));
   Serial.print(PIN_PEN);
-  Serial.print(F(" X_LIM="));
-  Serial.println(PIN_X_LIMIT);
+  Serial.print(F(" X1_LIM="));
+  Serial.print(PIN_X1_LIMIT);
+  Serial.print(F(" X2_LIM="));
+  Serial.println(PIN_X2_LIMIT);
   Serial.print(F("HEAD UART rx="));
   Serial.print(PIN_HEAD_RX);
   Serial.print(F(" tx="));
@@ -708,6 +713,8 @@ void setup() {
   Serial.println(HEAD_BAUD);
   Serial.println(F("Type HELP for diag commands"));
   Serial.println(F("======================================"));
+  
+  updateLimitFlags();
 }
 
 void emergencyStop() {
