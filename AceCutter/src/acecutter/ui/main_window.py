@@ -16,7 +16,7 @@ from ..domain.document import Workspace
 from ..domain.geometry import Transform
 from ..domain.layout import (
     apply, center_x_transform, fit_width_transform, polylines_bounds,
-    to_origin_transform,
+    rotate_about_transform, to_origin_transform,
 )
 from ..driver.streamer import GrblStreamer
 from ..driver.transport import SerialTransport, Transport
@@ -97,12 +97,18 @@ class MainWindow(QMainWindow):
         pass  # весь орган управления — в правой панели, сверху ничего не висит
 
     def _build_shortcuts(self) -> None:
+        # буквы работают по всему окну (WidgetWithChildren): спинбоксы буквы
+        # всё равно не едят, а канвас не текстовое поле
         for seq, fn in (
             (QKeySequence(Qt.Key.Key_Delete), self._delete_selected),
             (QKeySequence.StandardKey.SelectAll, self.canvas.select_all),
             (QKeySequence(Qt.Key.Key_Escape), self._esc_pressed),
             (QKeySequence(Qt.Key.Key_Return), self._enter_pressed),
             (QKeySequence(Qt.Key.Key_Enter), self._enter_pressed),
+            (QKeySequence(Qt.Key.Key_C), self._align_center_x),
+            (QKeySequence(Qt.Key.Key_X), self._align_origin),
+            (QKeySequence(Qt.Key.Key_V), self._align_fit),
+            (QKeySequence(Qt.Key.Key_R), self._rotate_selected),
         ):
             act = QAction(self)
             act.setShortcut(seq)
@@ -119,6 +125,8 @@ class MainWindow(QMainWindow):
     def _enter_pressed(self) -> None:
         if self.canvas.editing:
             self.canvas.apply_scale_edit()
+        elif self.canvas.selected_count():
+            self.canvas.enter_scale_edit()  # Enter по выделению = «Изменить»
 
     def _delete_selected(self) -> None:
         n = self.canvas.delete_selected()
@@ -272,19 +280,35 @@ class MainWindow(QMainWindow):
             self.canvas.set_workspace(self._workspace)
 
     def _align_center_x(self) -> None:
+        if self.canvas.editing:
+            return  # в правке контуры — управляемые копии, не подменяем
         sel = self.canvas.polylines_selected()
         if sel:
             self.canvas.replace_selected(apply(sel, center_x_transform(sel, self._workspace.width_mm)))
 
     def _align_origin(self) -> None:
+        if self.canvas.editing:
+            return
         sel = self.canvas.polylines_selected()
         if sel:
             self.canvas.replace_selected(apply(sel, to_origin_transform(sel)))
 
     def _align_fit(self) -> None:
+        if self.canvas.editing:
+            return
         sel = self.canvas.polylines_selected()
         if sel:
             self.canvas.replace_selected(apply(sel, fit_width_transform(sel, self._workspace.width_mm)))
+
+    def _rotate_selected(self) -> None:
+        """R: повернуть выделенное на 90° по часовой вокруг его центра."""
+        if self.canvas.editing:
+            return
+        sel = self.canvas.polylines_selected()
+        if sel:
+            # по часовой на экране = -90° в математике поля (Y вверх)
+            self.canvas.replace_selected(apply(sel, rotate_about_transform(sel, -90.0)))
+            self._set_status("Повернуто на 90° по часовой")
 
     def _on_ctx_action(self, action: str) -> None:
         """Контекстное меню канваса: применяется только к выделенному."""
@@ -300,6 +324,8 @@ class MainWindow(QMainWindow):
             t = to_origin_transform(sel)
         elif action == "fit":
             t = fit_width_transform(sel, self._workspace.width_mm)
+        elif action == "rotate":
+            t = rotate_about_transform(sel, -90.0)  # по часовой глазами юзера
         else:
             return
         self.canvas.replace_selected(apply(sel, t))

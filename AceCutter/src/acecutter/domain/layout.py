@@ -67,6 +67,22 @@ def scale_about_transform(polylines: list[Polyline],
             @ Transform.translate(-cx, -cy))
 
 
+def rotate_about_transform(polylines: list[Polyline], deg_ccw: float) -> Transform:
+    """Поворот вокруг центра bounds выделения — деталь вертится на месте.
+
+    deg_ccw — математические градусы (положительный = против часовой,
+    поле Y вверх). «По часовой 90°» у юзера = deg_ccw=-90.
+    """
+    b = polylines_bounds(polylines)
+    if b is None:
+        return Transform()
+    cx = (b[0] + b[2]) / 2.0
+    cy = (b[1] + b[3]) / 2.0
+    return (Transform.translate(cx, cy)
+            @ Transform.rotate(deg_ccw)
+            @ Transform.translate(-cx, -cy))
+
+
 # --- интерактивный масштаб за хэндлы -------------------------------------
 
 HANDLES = ("tl", "tr", "bl", "br", "l", "r", "t", "b")

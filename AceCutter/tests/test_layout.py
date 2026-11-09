@@ -3,7 +3,7 @@ from __future__ import annotations
 from acecutter.domain.geometry import Point
 from acecutter.domain.layout import (
     center_x_transform, fit_width_transform, handle_scale, polylines_bounds,
-    scale_about_transform, to_origin_transform,
+    rotate_about_transform, scale_about_transform, to_origin_transform,
 )
 from acecutter.domain.shapes import Polyline
 
@@ -71,3 +71,16 @@ def test_handle_scale_min_size():
     # мышь за пивотом: не даём вывернуть в ноль/минус
     sx, sy, _, _ = handle_scale((0, 0, 20, 10), "r", -100, 0)
     assert sx == 0.5 / 20  # min_size 0.5 мм
+
+
+def test_rotate_about_center():
+    # полоса 40×10, центр (20,5): поворот вокруг центра, не улетает
+    bar = Polyline([Point(0, 0), Point(40, 0), Point(40, 10), Point(0, 10)], True)
+    # -90° (CCW-): (x,y)→(y,-x) отн. центра → X 15..25, Y -15..25
+    t = rotate_about_transform([bar], -90.0)
+    assert polylines_bounds([bar.transformed(t)]) == (15.0, -15.0, 25.0, 25.0)
+    # центр на месте при любом угле
+    t = rotate_about_transform([bar], 37.0)
+    assert t.apply(Point(20, 5)) == Point(20, 5)
+    # пустой ввод — тождество
+    assert rotate_about_transform([], 90.0).apply(Point(3, 4)) == Point(3, 4)

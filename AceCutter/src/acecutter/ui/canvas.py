@@ -15,7 +15,9 @@ import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QTransform
-from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QMenu)
+from PySide6.QtWidgets import (
+    QGraphicsItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QMenu,
+)
 
 from ..domain.document import Workspace
 from ..domain.geometry import Transform
@@ -26,11 +28,18 @@ _CONTOUR = 0   # userData: исходная полилиния в мм
 _HANDLE = 1    # userData: имя хэндла
 
 _HANDLE_CURSORS = {
+    # курсоры режима МАСШТАБА; в режиме поворота углы получают CrossCursor
     "tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
     "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
     "l": Qt.CursorShape.SizeHorCursor, "r": Qt.CursorShape.SizeHorCursor,
     "t": Qt.CursorShape.SizeVerCursor, "b": Qt.CursorShape.SizeVerCursor,
 }
+_ANGLE_HANDLES = frozenset(("tl", "tr", "bl", "br"))
+_ROT_SNAP_DEG = 15.0  # Shift при повороте — шаг 15°
+# поворотный режим рамки: янтарь, чтобы глаз сразу отличал от масштаба
+_ROT_FRAME = "#d9962b"
+_ROT_HPEN = "#8a5a00"
+_ROT_HBRUSH = "#f0c987"
 _HANDLE_SIZE = 2.4  # мм
 
 
@@ -65,6 +74,15 @@ class CanvasView(QGraphicsView):
         self._handles: dict[str, QGraphicsItem] = {}
         self._edit_frame: QGraphicsItem | None = None
         self._active_handle: str | None = None
+        # режим правки: "scale" | "rotate" | None. Переключается двойным
+        # кликом внутри правки (_toggle_edit_mode), живёт до выхода из неё
+        self._edit_mode: str | None = None
+        # вращение за угловой хэндл (режим правки): центр/радиус/старт-угол в мм
+        self._rot_center: tuple[float, float] | None = None
+        self._rot_radius = 0.0
+        self._rot_start_angle = 0.0  # радианы, мм-система (CCW+, Y вверх)
+        self._rot_arrow: QGraphicsItem | None = None
+        self._rot_label: QGraphicsItem | None = None
         # визуализация задания
         self._job_paths: list[dict] = []
         self._job_ci = 0
@@ -110,6 +128,24 @@ class CanvasView(QGraphicsView):
                 return
         super().keyPressEvent(e)
 
+    def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton and self.editing:
+            # двойной клик в правке: масштаб ⇄ поворот
+            self._toggle_edit_mode()
+            e.accept()
+            return
+        # двойной клик по контуру = «Изменить» (как Enter и пункт меню)
+        if e.button() == Qt.MouseButton.LeftButton and not self.editing:
+            item = self.itemAt(e.position().toPoint())
+            if item is not None and item.data(_CONTOUR) is not None:
+                if not item.isSelected():
+                    self._scene.clearSelection()
+                    item.setSelected(True)
+                self.enter_scale_edit()
+                e.accept()
+                return
+        super().mouseDoubleClickEvent(e)
+
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.RightButton:
             if self.editing:
@@ -126,9 +162,33 @@ class CanvasView(QGraphicsView):
             h = self._handle_at(e.position().toPoint())
             if h:
                 self._active_handle = h
+                if h in _ANGLE_HANDLES and self._edit_mode == "rotate":
+                    p = self.mapToScene(e.position().toPoint())
+                    self._init_rotate(p.x(), -p.y())
             e.accept()
             return
         super().mousePressEvent(e)
+
+    def _init_rotate(self, mx: float, my: float) -> None:
+        """Инициализация протяжки-поворота от центра ТЕКУЩИХ bounds (в мм)."""
+        x0, y0, x1, y1 = self._edit_bounds
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        self._rot_center = (cx, cy)
+        self._rot_radius = math.hypot(mx - cx, my - cy)
+        self._rot_start_angle = math.atan2(my - cy, mx - cx)
+
+    def _toggle_edit_mode(self) -> None:
+        """Двойной клик в правке: масштаб ⇄ поворот (фичи разделены)."""
+        self._edit_mode = "rotate" if self._edit_mode != "rotate" else "scale"
+        self._drop_rotate_visual()
+        self._build_edit_decor()
+        if self._edit_mode == "rotate":
+            self.sizeHint.emit(f"Поворот: тяни за углы (Shift — шаг "
+                               f"{_ROT_SNAP_DEG:.0f}°) · двойной клик — размер "
+                               "· ПКМ/Enter — ок · Esc — отмена")
+        else:
+            self.sizeHint.emit("Размер: тяни рамку (Shift — пропорции) · "
+                               "двойной клик — поворот · ПКМ/Enter — ок · Esc — отмена")
 
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
         if self._panning:
@@ -140,8 +200,12 @@ class CanvasView(QGraphicsView):
             return
         if self._active_handle:
             p = self.mapToScene(e.position().toPoint())
-            self._scale_from_mm(p.x(), -p.y(),
-                                bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+            shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if (self._edit_mode == "rotate"
+                    and self._active_handle in _ANGLE_HANDLES):
+                self._rotate_from_mm(p.x(), -p.y(), snap=shift)
+            else:
+                self._scale_from_mm(p.x(), -p.y(), proportional=shift)
             e.accept()
             return
         if self.editing and e.buttons() == Qt.MouseButton.LeftButton:
@@ -157,6 +221,7 @@ class CanvasView(QGraphicsView):
             return
         if e.button() == Qt.MouseButton.LeftButton and self._active_handle:
             self._active_handle = None
+            self._drop_rotate_visual()
             self._bake_scale()  # рамка и хэндлы остаются вокруг нового размера
             e.accept()
             return
@@ -170,17 +235,19 @@ class CanvasView(QGraphicsView):
     # -- контекстные меню ----------------------------------------------------
 
     def _contour_menu(self, global_pos, item: QGraphicsItem) -> None:
-        """ПКМ по вектору: действия с выделением."""
+        """ПКМ по вектору: действия с выделением (в скобках — хоткеи)."""
         if not item.isSelected():
             self._scene.clearSelection()
             item.setSelected(True)
         menu = QMenu(self)
-        menu.addAction("⇔ Центр по ширине", lambda: self.ctxAction.emit("center"))
-        menu.addAction("↙ В ноль", lambda: self.ctxAction.emit("origin"))
-        menu.addAction("↔ Вписать в ширину", lambda: self.ctxAction.emit("fit"))
+        menu.addAction("⇔ Центр по ширине (C)", lambda: self.ctxAction.emit("center"))
+        menu.addAction("↙ В ноль (X)", lambda: self.ctxAction.emit("origin"))
+        menu.addAction("↔ Вписать в ширину (V)", lambda: self.ctxAction.emit("fit"))
         menu.addSeparator()
-        menu.addAction("✥ Изменить…", lambda: self.ctxAction.emit("resize"))
-        menu.addAction("🗑 Удалить", self.delete_selected)
+        menu.addAction("⟳ Повернуть (R)", lambda: self.ctxAction.emit("rotate"))
+        menu.addAction("✥ Изменить (Enter)", lambda: self.ctxAction.emit("resize"))
+        menu.addSeparator()
+        menu.addAction("🗑 Удалить (Del)", self.delete_selected)
         menu.exec(global_pos)
 
     def _edit_menu(self, global_pos) -> None:
@@ -204,14 +271,15 @@ class CanvasView(QGraphicsView):
         self._edit_orig0 = list(self._edit_orig)  # снапшот для «Отмена»
         self._edit_dirty = False
         self._edit_t = Transform()
+        self._edit_mode = "scale"  # двойной клик в правке сменит на поворот
         self._edit_items = items  # recreate удалит их и создаст управляемые копии
         for it in self.contour_items():
             it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self._recreate_edit_items(self._edit_orig)
         self.setFocus()
-        self.sizeHint.emit("Растяни за края · Shift — пропорции · "
-                           "ПКМ/Enter — ок · Esc — отмена")
+        self.sizeHint.emit("Тяни рамку — размер (Shift — пропорции) · "
+                           "двойной клик — поворот · ПКМ/Enter — ок · Esc — отмена")
 
     def _edit_bounds_of(self, polys: list[Polyline]):
         rects = [b for b in (pl.bounds() for pl in polys) if b]
@@ -239,19 +307,25 @@ class CanvasView(QGraphicsView):
         self._build_edit_decor()
 
     def _build_edit_decor(self) -> None:
-        """Рамка и 8 хэндлов вокруг текущего _edit_bounds."""
+        """Рамка и хэндлы вокруг текущего _edit_bounds.
+
+        Режим виден глазами: масштаб — сине-зелёная рамка и все 8 хэндлов,
+        поворот — янтарная рамка и только 4 угла (рёбра спрятаны).
+        """
         for r in self._handles.values():
             self._scene.removeItem(r)
         self._handles = {}
         if self._edit_frame is not None:
             self._scene.removeItem(self._edit_frame)
         x0, y0, x1, y1 = self._edit_bounds
-        frame_pen = QPen(QColor("#2e7d9e"), 0.0, Qt.PenStyle.DashLine)
+        rot = self._edit_mode == "rotate"
+        frame_pen = QPen(QColor(_ROT_FRAME if rot else "#2e7d9e"),
+                         0.0, Qt.PenStyle.DashLine)
         self._edit_frame = self._scene.addRect(
             QRectF(x0, -y1, x1 - x0, y1 - y0), frame_pen)
         self._edit_frame.setZValue(9)
-        hpen = QPen(QColor("#1d4f63"), 0.0)
-        hbrush = QColor("#7fc4e8")
+        hpen = QPen(QColor(_ROT_HPEN if rot else "#1d4f63"), 0.0)
+        hbrush = QColor(_ROT_HBRUSH if rot else "#7fc4e8")
         # квадратик живёт в (0,0), позиция — только setPos: иначе rect+pos
         # складываются и хэндл улетает «правее и выше» при протяжке
         hrect = QRectF(-_HANDLE_SIZE / 2, -_HANDLE_SIZE / 2,
@@ -262,8 +336,14 @@ class CanvasView(QGraphicsView):
             r.setPos(hx, hy)
             r.setZValue(10)
             r.setData(_HANDLE, name)
-            r.setCursor(_HANDLE_CURSORS[name])
             r.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            if rot:
+                if name not in _ANGLE_HANDLES:
+                    r.hide()  # в повороте крутим только за углы
+                else:
+                    r.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                r.setCursor(_HANDLE_CURSORS[name])
             self._handles[name] = r
 
     def _handle_scene_pos(self, name: str) -> tuple[float, float]:
@@ -303,6 +383,100 @@ class CanvasView(QGraphicsView):
                            + (" · пропорции" if proportional else ""))
         self._edit_dirty = True
 
+    def _rotate_from_mm(self, mx: float, my: float, *, snap: bool) -> None:
+        """Угловой хэндл в протяжке: поворот вокруг центра bounds + дуга-стрелка."""
+        cx, cy = self._rot_center
+        theta = math.degrees(math.atan2(my - cy, mx - cx) - self._rot_start_angle)
+        if snap:
+            theta = round(theta / _ROT_SNAP_DEG) * _ROT_SNAP_DEG
+        self._edit_t = (Transform.translate(cx, cy)
+                        @ Transform.rotate(theta)
+                        @ Transform.translate(-cx, -cy))
+        # превью на живых айтемах: сцена Y вниз, поэтому вокруг (cx,-cy)
+        # вращаем на -theta (сопряжение флипа Y меняет знак угла)
+        qt = QTransform()
+        qt.translate(cx, -cy)
+        qt.rotate(-theta)
+        qt.translate(-cx, cy)
+        for it in self._edit_items:
+            it.setTransform(qt)
+        self._edit_frame.setTransform(qt)
+        # активный хэндл едет по окружности, остальные спрятаны
+        r = self._rot_radius
+        a = math.atan2(my - cy, mx - cx)
+        for name, h in self._handles.items():
+            if name == self._active_handle:
+                h.setPos(cx + r * math.cos(a), -(cy + r * math.sin(a)))
+                h.show()
+            else:
+                h.hide()
+        self._show_rotate_visual(theta)
+        d = ((-theta + 180.0) % 360.0) - 180.0  # юзеру: по часовой — плюс
+        self.sizeHint.emit(f"Поворот {d:+.0f}°"
+                           + (f" (шаг {_ROT_SNAP_DEG:.0f}°)" if snap else ""))
+        self._edit_dirty = True
+
+    def _show_rotate_visual(self, theta_deg: float) -> None:
+        """Дуга-стрелка от центра к хэндлу + подпись градусов.
+
+        Дуга строится полилинией по точкам: семантика углов arcTo в
+        Y-вниз системе — минное поле, а тут всё детерминировано.
+        """
+        cx, cy = self._rot_center
+        r = max(self._rot_radius * 0.8, 6.0)
+        a0 = -self._rot_start_angle       # scene-углы = минус мм-углы (Y флип)
+        sweep = -math.radians(theta_deg)  # мм CCW+ → scene: по часовой плюс
+        cx_s, cy_s = cx, -cy
+
+        def pt(a: float) -> QPointF:
+            return QPointF(cx_s + r * math.cos(a), cy_s + r * math.sin(a))
+
+        path = QPainterPath(pt(a0))
+        nseg = 48
+        for i in range(1, nseg + 1):
+            path.lineTo(pt(a0 + sweep * i / nseg))
+        # наконечник в конце дуги вдоль касательной по направлению движения
+        ae = a0 + sweep
+        sgn = 1.0 if sweep >= 0.0 else -1.0
+        tx, ty = -math.sin(ae) * sgn, math.cos(ae) * sgn
+        nx, ny = math.cos(ae), math.sin(ae)
+        ex, ey = cx_s + r * math.cos(ae), cy_s + r * math.sin(ae)
+        tip, half_w = 3.0, 1.1
+        path.moveTo(ex + tx * tip, ey + ty * tip)
+        path.lineTo(ex + nx * half_w, ey + ny * half_w)
+        path.lineTo(ex - nx * half_w, ey - ny * half_w)
+        path.closeSubpath()
+        if self._rot_arrow is None:
+            self._rot_arrow = self._scene.addPath(path, QPen(QColor("#d9962b"), 0.0))
+            self._rot_arrow.setZValue(11)
+        else:
+            self._rot_arrow.setPath(path)
+        # подпись с градусами — у середины дуги, чуть дальше радиуса
+        d = ((-theta_deg + 180.0) % 360.0) - 180.0
+        mid = a0 + sweep / 2.0
+        if self._rot_label is None:
+            self._rot_label = QGraphicsSimpleTextItem(f"{d:+.0f}°")
+            f = QFont("Segoe UI", 9)
+            f.setBold(True)
+            self._rot_label.setFont(f)
+            self._rot_label.setBrush(QColor("#8a5a00"))
+            self._rot_label.setZValue(11)
+            self._scene.addItem(self._rot_label)
+        else:
+            self._rot_label.setText(f"{d:+.0f}°")
+        self._rot_label.setPos(cx_s + (r + 2.5) * math.cos(mid),
+                               cy_s + (r + 2.5) * math.sin(mid))
+
+    def _drop_rotate_visual(self) -> None:
+        """Убрать дугу и подпись (отпускание/выход из правки)."""
+        if self._rot_arrow is not None:
+            self._scene.removeItem(self._rot_arrow)
+            self._rot_arrow = None
+        if self._rot_label is not None:
+            self._scene.removeItem(self._rot_label)
+            self._rot_label = None
+        self._rot_center = None
+
     def _bake_scale(self) -> None:
         """Отпустили хэндл — запечь превью: рамка и хэндлы переезжают
         на новое место вокруг растянутых векторов, не возвращаясь назад."""
@@ -327,6 +501,8 @@ class CanvasView(QGraphicsView):
         self.sizeHint.emit("Изменение отменено")
 
     def _finish_edit(self) -> None:
+        self._drop_rotate_visual()
+        self._edit_mode = None
         for r in self._handles.values():
             self._scene.removeItem(r)
         self._handles = {}
